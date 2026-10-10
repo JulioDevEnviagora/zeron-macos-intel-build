@@ -1,0 +1,303 @@
+name: intel-release
+
+# Intel Mac (x86_64) builds of zeronsh/zeron, which upstream does not
+# publish, served as an update feed for the app's built-in updater.
+#
+# Hourly, the check job compares upstream's latest release with this
+# repository's releases. When no Intel build of it is published here yet, the
+# build job compiles that upstream tag on an Intel runner and publishes a
+# release with
+#   zeron-<version>-macos-x86_64.dmg          (first install)
+#   zeron-<version>-macos-x86_64-app.tar.gz   (auto-update payload)
+#   manifest.json                             ({version, files: {name: {sha256}}})
+# Every build bakes ZERON_RELEASES_URL=<this repository>/releases/latest/download
+# into Info.plist (LSEnvironment), so an installed build keeps updating from
+# here instead of zeron.sh, which has no Intel artifacts.
+#
+# ort-sys has no prebuilt ONNX Runtime for Intel macOS, so the version the
+# upstream tag pins is built from source once and its static libraries are
+# cached.
+#
+# A version whose build fails is retried by the schedule until it has failed
+# MAX_ATTEMPTS times (counted on its draft release); after that, run this
+# workflow manually with `force`.
+
+on:
+  schedule:
+    - cron: "17 * * * *"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Upstream version to build, e.g. 0.2.108 (empty = latest release)
+        required: false
+        default: ""
+      force:
+        description: Build even if this version is already published or out of attempts
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: intel-release
+  cancel-in-progress: false
+
+env:
+  UPSTREAM: zeronsh/zeron
+  MAX_ATTEMPTS: 2
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: write
+    outputs:
+      build: ${{ steps.decide.outputs.build }}
+      tag: ${{ steps.decide.outputs.tag }}
+      version: ${{ steps.decide.outputs.version }}
+      latest: ${{ steps.decide.outputs.latest }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: keep the schedule enabled
+        # GitHub disables scheduled workflows in public repositories after 60
+        # days without activity; re-enabling resets that clock.
+        run: |
+          gh api -X PUT "repos/$GITHUB_REPOSITORY/actions/workflows/intel-release.yml/enable" \
+            || echo "::warning::could not re-enable the schedule"
+      - name: decide
+        id: decide
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+          FORCE: ${{ inputs.force }}
+        run: |
+          set -euo pipefail
+          upstream_tag="$(gh release view --repo "$UPSTREAM" --json tagName --jq .tagName)"
+          tag="$upstream_tag"
+          if [[ -n "${INPUT_VERSION:-}" ]]; then
+            tag="v${INPUT_VERSION#v}"
+          fi
+          version="${tag#v}"
+          [[ "$version" =~ ^[0-9]+(\.[0-9]+)+$ ]] || { echo "::error::invalid version '$version'"; exit 1; }
+          gh release view "$tag" --repo "$UPSTREAM" >/dev/null
+          release="$(gh api "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
+            --jq "map(select(.tag_name == \"$tag\")) | first // empty")"
+          build=true
+          if [[ -n "$release" && "${FORCE:-false}" != "true" ]]; then
+            if [[ "$(jq -r .draft <<<"$release")" == "false" ]]; then
+              build=false
+              echo "$tag is already published"
+            else
+              body="$(jq -r '.body // ""' <<<"$release")"
+              attempts=0
+              if [[ "$body" =~ Build\ attempts:\ ([0-9]+) ]]; then
+                attempts="${BASH_REMATCH[1]}"
+              fi
+              if (( attempts >= MAX_ATTEMPTS )); then
+                build=false
+                echo "::warning::$tag failed ${attempts} builds; run this workflow with force to retry"
+              fi
+            fi
+          fi
+          latest=false
+          if [[ "$tag" == "$upstream_tag" ]]; then
+            latest=true
+          fi
+          {
+            echo "build=$build"
+            echo "tag=$tag"
+            echo "version=$version"
+            echo "latest=$latest"
+          } >>"$GITHUB_OUTPUT"
+          echo "upstream latest $upstream_tag, target $tag, build $build"
+
+  build:
+    needs: check
+    if: needs.check.outputs.build == 'true'
+    runs-on: macos-15-intel
+    timeout-minutes: 300
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: ${{ needs.check.outputs.tag }}
+      VERSION: ${{ needs.check.outputs.version }}
+      LATEST: ${{ needs.check.outputs.latest }}
+      FEED_URL: https://github.com/${{ github.repository }}/releases/latest/download
+    steps:
+      - name: record the attempt
+        # A draft release marks the version as attempted; the check job reads
+        # its count. A published release (forced rebuild) keeps serving until
+        # its assets are replaced.
+        run: |
+          set -euo pipefail
+          release="$(gh api "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
+            --jq "map(select(.tag_name == \"$TAG\")) | first // empty")"
+          if [[ -z "$release" ]]; then
+            gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --draft \
+              --title "Zeron $VERSION (Intel)" --notes "Build attempts: 1"
+          elif [[ "$(jq -r .draft <<<"$release")" == "true" ]]; then
+            body="$(jq -r '.body // ""' <<<"$release")"
+            attempts=0
+            if [[ "$body" =~ Build\ attempts:\ ([0-9]+) ]]; then
+              attempts="${BASH_REMATCH[1]}"
+            fi
+            gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" \
+              --notes "Build attempts: $(( attempts + 1 ))"
+          fi
+
+      - name: checkout zeronsh/zeron
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          repository: ${{ env.UPSTREAM }}
+          ref: ${{ needs.check.outputs.tag }}
+          path: zeron
+          persist-credentials: false
+
+      - name: pinned ONNX Runtime version
+        id: ort
+        run: |
+          set -euo pipefail
+          # The dictation reference records the runtime ort-sys is built against.
+          version="$(grep -oE 'ONNX Runtime \*\*[0-9]+\.[0-9]+\.[0-9]+\*\*' \
+            zeron/docs/reference/desktop-dictation.md | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || true)"
+          [[ -n "$version" ]] || { echo "::error::no pinned ONNX Runtime version in docs/reference/desktop-dictation.md"; exit 1; }
+          echo "version=$version" >>"$GITHUB_OUTPUT"
+          echo "ORT_LIB_PATH=$GITHUB_WORKSPACE/ort-lib" >>"$GITHUB_ENV"
+
+      - name: restore ONNX Runtime
+        id: ort-cache
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ort-lib
+          key: ort-lib-${{ steps.ort.outputs.version }}-macos-x86_64-v1
+
+      - name: checkout ONNX Runtime
+        if: steps.ort-cache.outputs.cache-hit != 'true'
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          repository: microsoft/onnxruntime
+          ref: v${{ steps.ort.outputs.version }}
+          path: onnxruntime
+          submodules: recursive
+          persist-credentials: false
+
+      - name: build ONNX Runtime
+        if: steps.ort-cache.outputs.cache-hit != 'true'
+        working-directory: onnxruntime
+        run: |
+          ./build.sh --config Release --update --build --parallel \
+            --skip_submodule_sync --compile_no_warning_as_error \
+            --cmake_extra_defines CMAKE_OSX_ARCHITECTURES=x86_64
+
+      - name: collect ONNX Runtime static libraries
+        if: steps.ort-cache.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          src=onnxruntime/build/MacOS/Release
+          (cd "$src" && find . -name '*.a' -not -path './CMakeFiles/*') | while read -r lib; do
+            mkdir -p "ort-lib/$(dirname "$lib")"
+            cp "$src/$lib" "ort-lib/$lib"
+          done
+          # ort-sys 2.0.0-rc.13 links a fixed list of ONNX Runtime archives that
+          # predates the model_package library onnxruntime_session calls into
+          # (new in 1.28); fold it into that archive so the link resolves.
+          xcrun libtool -static -o ort-lib/libonnxruntime_session.a \
+            "$src/libonnxruntime_session.a" "$src/model_package/libmodel_package.a"
+          nm ort-lib/libonnxruntime_session.a | grep ' T _ModelPackage_Open$' >/dev/null
+          du -sh ort-lib
+
+      - name: save ONNX Runtime
+        if: steps.ort-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ort-lib
+          key: ${{ steps.ort-cache.outputs.cache-primary-key }}
+
+      - name: rust toolchain (rust-toolchain.toml)
+        working-directory: zeron
+        run: rustup show active-toolchain || rustup toolchain install
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: zeron
+          # ort-sys bundles ort-lib into its rlib; a new ort-lib must rebuild it.
+          key: ${{ steps.ort-cache.outputs.cache-primary-key }}
+          cache-on-failure: true
+
+      - name: package dmg
+        working-directory: zeron
+        run: |
+          set -euo pipefail
+          cargo_version="$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)".*/\1/')"
+          [[ "$cargo_version" == "$VERSION" ]] || { echo "::error::Cargo.toml is $cargo_version, expected $VERSION"; exit 1; }
+          /usr/libexec/PlistBuddy -c "Add :LSEnvironment dict" \
+            -c "Add :LSEnvironment:ZERON_RELEASES_URL string $FEED_URL" dist/macos/Info.plist
+          scripts/package-macos.sh
+
+      - name: verify package
+        working-directory: zeron/target/package
+        run: |
+          set -euo pipefail
+          plist=Zeron.app/Contents/Info.plist
+          file Zeron.app/Contents/MacOS/zeron | grep 'x86_64' >/dev/null
+          Zeron.app/Contents/MacOS/zeron --version | grep -F "$VERSION" >/dev/null
+          [[ "$(plutil -extract CFBundleShortVersionString raw "$plist")" == "$VERSION" ]]
+          [[ "$(plutil -extract LSEnvironment.ZERON_RELEASES_URL raw "$plist")" == "$FEED_URL" ]]
+          tar -tzf "zeron-$VERSION-macos-x86_64-app.tar.gz" | grep -x 'Zeron.app/Contents/MacOS/zeron' >/dev/null
+          ls -lh "zeron-$VERSION-macos-x86_64.dmg" "zeron-$VERSION-macos-x86_64-app.tar.gz"
+
+      - name: publish
+        working-directory: zeron/target/package
+        run: |
+          set -euo pipefail
+          tarball="zeron-$VERSION-macos-x86_64-app.tar.gz"
+          dmg="zeron-$VERSION-macos-x86_64.dmg"
+          jq -n --arg version "$VERSION" \
+            --arg tarball "$tarball" --arg tarball_sha256 "$(shasum -a 256 "$tarball" | cut -d' ' -f1)" \
+            --arg dmg "$dmg" --arg dmg_sha256 "$(shasum -a 256 "$dmg" | cut -d' ' -f1)" \
+            '{version: $version, files: {($tarball): {sha256: $tarball_sha256}, ($dmg): {sha256: $dmg_sha256}}}' \
+            >manifest.json
+          cat manifest.json
+          gh release upload "$TAG" "$tarball" "$dmg" manifest.json --clobber --repo "$GITHUB_REPOSITORY"
+          commit="$(git -C "$GITHUB_WORKSPACE/zeron" rev-parse HEAD)"
+          notes="$(printf '%s\n' \
+            "Intel (x86_64) build of [$UPSTREAM $TAG](https://github.com/$UPSTREAM/releases/tag/$TAG), commit \`$commit\`." \
+            "" \
+            "Ad-hoc signed. First install: open the dmg and drag Zeron to Applications (if macOS blocks the first launch, right-click Zeron and choose Open). After that, Zeron updates itself from this repository's latest release.")"
+          gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --draft=false --latest="$LATEST" \
+            --title "Zeron $VERSION (Intel)" --notes "$notes"
+
+      - name: verify feed
+        if: needs.check.outputs.latest == 'true'
+        run: |
+          set -euo pipefail
+          # The same requests the app's updater makes.
+          served=""
+          for attempt in 1 2 3 4 5 6; do
+            served="$(curl -fsSL -H 'Cache-Control: no-cache' "$FEED_URL/manifest.json" | jq -r .version || true)"
+            if [[ "$served" == "$VERSION" ]]; then
+              break
+            fi
+            sleep 10
+          done
+          [[ "$served" == "$VERSION" ]] || { echo "::error::feed serves '$served', expected $VERSION"; exit 1; }
+          curl -fsSL -r 0-0 -o /dev/null "$FEED_URL/zeron-$VERSION-macos-x86_64-app.tar.gz"
+
+      - name: record the published version
+        if: needs.check.outputs.latest == 'true'
+        # A commit per release also counts as repository activity for the
+        # 60-day schedule rule.
+        run: |
+          set -euo pipefail
+          path=.github/intel-latest
+          sha="$(gh api "repos/$GITHUB_REPOSITORY/contents/$path" --jq .sha 2>/dev/null || true)"
+          args=(-X PUT "repos/$GITHUB_REPOSITORY/contents/$path"
+            -f message="Intel build $VERSION"
+            -f content="$(printf '%s\n' "$VERSION" | base64)")
+          if [[ -n "$sha" ]]; then
+            args+=(-f sha="$sha")
+          fi
+          gh api "${args[@]}" >/dev/null
