@@ -18,6 +18,15 @@ name: intel-release
 # upstream tag pins is built from source once and its static libraries are
 # cached.
 #
+# Signing: upstream signs ad hoc, and an ad-hoc designated requirement is the
+# binary's cdhash, so macOS forgets every permission (files, microphone, ...)
+# on each update. Builds here are signed with one fixed self-signed
+# certificate (secrets SIGNING_P12_BASE64 / SIGNING_P12_PASSWORD, pinned by
+# SIGNING_CERT_SHA1) so the requirement stays identical across versions:
+#   identifier "sh.zeron.app" and certificate leaf = H"<SIGNING_CERT_SHA1>"
+# The key is imported only after the Rust build, so build scripts never see it.
+# Replacing the certificate resets every permission once.
+#
 # A version whose build fails is retried by the schedule until it has failed
 # MAX_ATTEMPTS times (counted on its draft release); after that, run this
 # workflow manually with `force`.
@@ -126,6 +135,7 @@ jobs:
       VERSION: ${{ needs.check.outputs.version }}
       LATEST: ${{ needs.check.outputs.latest }}
       FEED_URL: https://github.com/${{ github.repository }}/releases/latest/download
+      SIGNING_CERT_SHA1: 03338cac93d4944709079339bc97c881ab228405
     steps:
       - name: record the attempt
         # A draft release marks the version as attempted; the check job reads
@@ -227,14 +237,62 @@ jobs:
           key: ${{ steps.ort-cache.outputs.cache-primary-key }}
           cache-on-failure: true
 
-      - name: package dmg
+      - name: build
         working-directory: zeron
         run: |
           set -euo pipefail
           cargo_version="$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)".*/\1/')"
           [[ "$cargo_version" == "$VERSION" ]] || { echo "::error::Cargo.toml is $cargo_version, expected $VERSION"; exit 1; }
+          cargo build --release -p zeron
+
+      - name: import signing identity
+        env:
+          SIGNING_P12_BASE64: ${{ secrets.SIGNING_P12_BASE64 }}
+          SIGNING_P12_PASSWORD: ${{ secrets.SIGNING_P12_PASSWORD }}
+        run: |
+          set -euo pipefail
+          if [[ -z "$SIGNING_P12_BASE64" || -z "$SIGNING_P12_PASSWORD" ]]; then
+            echo "::error::secrets SIGNING_P12_BASE64 / SIGNING_P12_PASSWORD are missing; an ad-hoc build would make macOS forget Zeron's permissions"
+            exit 1
+          fi
+          p12="$RUNNER_TEMP/id.p12"
+          cert="$RUNNER_TEMP/cert.pem"
+          kc="$RUNNER_TEMP/sign.keychain-db"
+          pass="$(openssl rand -hex 16)"
+          printf '%s' "$SIGNING_P12_BASE64" | base64 -d >"$p12"
+          /usr/bin/openssl pkcs12 -in "$p12" -clcerts -nokeys -passin env:SIGNING_P12_PASSWORD -out "$cert"
+          actual="$(/usr/bin/openssl x509 -in "$cert" -noout -fingerprint -sha1 | sed 's/.*=//; s/://g' | tr 'A-F' 'a-f')"
+          [[ "$actual" == "$SIGNING_CERT_SHA1" ]] || { echo "::error::signing certificate is $actual, expected $SIGNING_CERT_SHA1"; exit 1; }
+          security create-keychain -p "$pass" "$kc"
+          security set-keychain-settings -lut 21600 "$kc"
+          security unlock-keychain -p "$pass" "$kc"
+          security import "$p12" -k "$kc" -P "$SIGNING_P12_PASSWORD" -T /usr/bin/codesign >/dev/null
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$pass" "$kc" >/dev/null
+          security list-keychains -d user -s "$kc" login.keychain-db
+          # codesign only uses identities macOS trusts for code signing, and a
+          # self-signed one is not until its certificate is marked as such.
+          sudo security add-trusted-cert -d -r trustRoot -p codeSign -k /Library/Keychains/System.keychain "$cert"
+          rm -f "$p12"
+          security find-identity -v -p codesigning "$kc" | grep -i "$SIGNING_CERT_SHA1"
+          # The check that passed used the hash in upper case, as `security` prints it.
+          echo "ZERON_SIGN_IDENTITY=$(printf '%s' "$SIGNING_CERT_SHA1" | tr 'a-f' 'A-F')" >>"$GITHUB_ENV"
+
+      - name: package dmg
+        working-directory: zeron
+        run: |
+          set -euo pipefail
           /usr/libexec/PlistBuddy -c "Add :LSEnvironment dict" \
             -c "Add :LSEnvironment:ZERON_RELEASES_URL string $FEED_URL" dist/macos/Info.plist
+          # Without CODESIGN_IDENTITY the script signs ad hoc (`--sign -`); keep
+          # that branch's flags but sign with the fixed identity.
+          python3 - <<'PY'
+          import pathlib
+          path = pathlib.Path("scripts/package-macos.sh")
+          text = path.read_text()
+          old = '--sign - "$APP"'
+          assert text.count(old) == 1, "ad-hoc signing line not found in scripts/package-macos.sh"
+          path.write_text(text.replace(old, '--sign "$ZERON_SIGN_IDENTITY" "$APP"'))
+          PY
           scripts/package-macos.sh
 
       - name: verify package
@@ -247,6 +305,11 @@ jobs:
           [[ "$(plutil -extract CFBundleShortVersionString raw "$plist")" == "$VERSION" ]]
           [[ "$(plutil -extract LSEnvironment.ZERON_RELEASES_URL raw "$plist")" == "$FEED_URL" ]]
           tar -tzf "zeron-$VERSION-macos-x86_64-app.tar.gz" | grep -x 'Zeron.app/Contents/MacOS/zeron' >/dev/null
+          codesign --verify --deep --strict Zeron.app
+          requirement="$(codesign -d -r- Zeron.app 2>&1 | sed -n 's/^designated => //p')"
+          expected="identifier \"sh.zeron.app\" and certificate leaf = H\"$SIGNING_CERT_SHA1\""
+          echo "designated requirement: $requirement"
+          [[ "$requirement" == "$expected" ]] || { echo "::error::designated requirement is not the fixed identity, expected: $expected"; exit 1; }
           ls -lh "zeron-$VERSION-macos-x86_64.dmg" "zeron-$VERSION-macos-x86_64-app.tar.gz"
 
       - name: publish
@@ -266,7 +329,7 @@ jobs:
           notes="$(printf '%s\n' \
             "Intel (x86_64) build of [$UPSTREAM $TAG](https://github.com/$UPSTREAM/releases/tag/$TAG), commit \`$commit\`." \
             "" \
-            "Ad-hoc signed. First install: open the dmg and drag Zeron to Applications (if macOS blocks the first launch, right-click Zeron and choose Open). After that, Zeron updates itself from this repository's latest release.")"
+            "Signed with a fixed self-signed certificate (not notarized). First install: open the dmg and drag Zeron to Applications (if macOS blocks the first launch, right-click Zeron and choose Open). After that, Zeron updates itself from this repository's latest release.")"
           gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --draft=false --latest="$LATEST" \
             --title "Zeron $VERSION (Intel)" --notes "$notes"
 
