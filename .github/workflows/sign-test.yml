@@ -40,6 +40,7 @@ jobs:
           security unlock-keychain -p pw "$kc"
           security import id.p12 -k "$kc" -P test -T /usr/bin/codesign >/dev/null
           security set-key-partition-list -S apple-tool:,apple: -s -k pw "$kc" >/dev/null
+          security list-keychains -d user -s "$kc" login.keychain-db
           echo "--- before trust ---"
           security find-identity -p codesigning "$kc"
           sudo security add-trusted-cert -d -r trustRoot -p codeSign -k /Library/Keychains/System.keychain cert.pem
@@ -69,7 +70,7 @@ jobs:
           for x in A B C D; do mk "$x" "build $x"; done
           printf '<?xml version="1.0" encoding="UTF-8"?>\n<plist version="1.0"><dict><key>com.apple.security.device.audio-input</key><true/></dict></plist>\n' >ent.plist
           for x in A B; do
-            codesign --deep --force --entitlements ent.plist --keychain "$KC" --sign "$SHA1" "$x.app"
+            codesign --deep --force --entitlements ent.plist --sign "$SHA1" "$x.app"
           done
           for x in C D; do
             codesign --deep --force --entitlements ent.plist --sign - "$x.app"
