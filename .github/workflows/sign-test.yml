@@ -1,0 +1,86 @@
+name: sign-test
+
+# Throwaway check of the code-signing recipe: a fixed self-signed identity must
+# give different builds of the same app an identical designated requirement.
+# Uses a certificate generated inside the job; no secrets involved.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  sign:
+    runs-on: macos-15-intel
+    timeout-minutes: 15
+    steps:
+      - name: identity
+        run: |
+          set -euo pipefail
+          name="Zeron Intel Signing Test"
+          cat >openssl.cnf <<EOF
+          [req]
+          distinguished_name = dn
+          x509_extensions = ext
+          prompt = no
+          [dn]
+          CN = $name
+          [ext]
+          basicConstraints = critical,CA:false
+          keyUsage = critical,digitalSignature
+          extendedKeyUsage = critical,codeSigning
+          EOF
+          /usr/bin/openssl req -x509 -newkey rsa:2048 -nodes -keyout key.pem -out cert.pem -days 3650 -config openssl.cnf 2>/dev/null
+          /usr/bin/openssl pkcs12 -export -inkey key.pem -in cert.pem -out id.p12 -passout pass:test -name "$name"
+          sha1="$(/usr/bin/openssl x509 -in cert.pem -noout -fingerprint -sha1 | sed 's/.*=//; s/://g')"
+          kc="$RUNNER_TEMP/sign.keychain-db"
+          security create-keychain -p pw "$kc"
+          security set-keychain-settings -lut 3600 "$kc"
+          security unlock-keychain -p pw "$kc"
+          security import id.p12 -k "$kc" -P test -T /usr/bin/codesign >/dev/null
+          security set-key-partition-list -S apple-tool:,apple: -s -k pw "$kc" >/dev/null
+          echo "--- before trust ---"
+          security find-identity -p codesigning "$kc"
+          sudo security add-trusted-cert -d -r trustRoot -p codeSign -k /Library/Keychains/System.keychain cert.pem
+          echo "--- after trust ---"
+          security find-identity -v -p codesigning "$kc"
+          { echo "KC=$kc"; echo "SHA1=$sha1"; } >>"$GITHUB_ENV"
+
+      - name: two builds, same identity
+        run: |
+          set -euo pipefail
+          mk() {
+            mkdir -p "$1.app/Contents/MacOS" "$1.app/Contents/Resources"
+            cp /bin/echo "$1.app/Contents/MacOS/zeron"
+            printf '%s\n' "$2" >"$1.app/Contents/Resources/marker.txt"
+            cat >"$1.app/Contents/Info.plist" <<EOF
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0"><dict>
+          <key>CFBundleIdentifier</key><string>sh.zeron.app</string>
+          <key>CFBundleExecutable</key><string>zeron</string>
+          <key>CFBundleName</key><string>Zeron</string>
+          <key>CFBundlePackageType</key><string>APPL</string>
+          <key>CFBundleShortVersionString</key><string>$2</string>
+          </dict></plist>
+          EOF
+          }
+          for x in A B C D; do mk "$x" "build $x"; done
+          printf '<?xml version="1.0" encoding="UTF-8"?>\n<plist version="1.0"><dict><key>com.apple.security.device.audio-input</key><true/></dict></plist>\n' >ent.plist
+          for x in A B; do
+            codesign --deep --force --entitlements ent.plist --keychain "$KC" --sign "$SHA1" "$x.app"
+          done
+          for x in C D; do
+            codesign --deep --force --entitlements ent.plist --sign - "$x.app"
+          done
+          show() { printf '%s cdhash=%s  ' "$1" "$(codesign -dvvv "$1.app" 2>&1 | sed -n 's/^CDHash=//p')"; codesign -d -r- "$1.app" 2>&1 | sed -n 's/^designated => //p'; }
+          echo "--- fixed identity ---"; show A; show B
+          echo "--- ad-hoc ---"; show C; show D
+          dr_a="$(codesign -d -r- A.app 2>&1 | sed -n 's/^designated => //p')"
+          dr_c="$(codesign -d -r- C.app 2>&1 | sed -n 's/^designated => //p')"
+          codesign --verify -R="$dr_a" B.app && echo "fixed identity: build B satisfies build A's requirement"
+          if codesign --verify -R="$dr_c" D.app 2>/dev/null; then echo "ad-hoc: unexpectedly satisfied"; else echo "ad-hoc: build D does NOT satisfy build C's requirement"; fi
+          codesign --verify --deep --strict A.app && echo "A.app verifies"
+          codesign -dvvv A.app 2>&1 | grep -E '^(Signature|TeamIdentifier|Authority|Identifier)' || true
+          codesign -d --entitlements - A.app 2>/dev/null | head -8
