@@ -130,6 +130,9 @@ jobs:
     permissions:
       contents: write
     env:
+      # Upstream's macos-app-icon.sh needs Xcode 26+ to compile Zeron.icon.
+      # macos-15-intel still defaults to Xcode 16.4, which produces no Assets.car.
+      DEVELOPER_DIR: /Applications/Xcode_26.3.app/Contents/Developer
       GH_TOKEN: ${{ github.token }}
       TAG: ${{ needs.check.outputs.tag }}
       VERSION: ${{ needs.check.outputs.version }}
@@ -137,6 +140,12 @@ jobs:
       FEED_URL: https://github.com/${{ github.repository }}/releases/latest/download
       SIGNING_CERT_SHA1: 03338cac93d4944709079339bc97c881ab228405
     steps:
+      - name: verify Xcode toolchain
+        run: |
+          set -euo pipefail
+          xcodebuild -version
+          xcrun --find actool
+
       - name: record the attempt
         # A draft release marks the version as attempted; the check job reads
         # its count. A published release (forced rebuild) keeps serving until
